@@ -1,19 +1,18 @@
-from flask import Flask, request, jsonify
-import requests
-import json
-import time
-import re
-import dns.resolver
-import smtplib
-import socket
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Any
 import hashlib
-from functools import wraps
-import os
 import logging
-from dataclasses import dataclass
+import os
 import random
+import re
+import socket
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from functools import wraps
+from typing import Dict, List
+
+import dns.resolver
+import requests
+from flask import Flask, jsonify, request
 
 # Configurar logging
 logging.basicConfig(level=logging.INFO)
@@ -23,7 +22,7 @@ app = Flask(__name__)
 
 # Cache e configurações
 cache = {}
-CACHE_DURATION = 300  # 5 minutos (reduzido para testes)
+CACHE_DURATION = 300  # 5 minutos
 
 def simple_cache(duration=CACHE_DURATION):
     """Cache simples baseado em hash do email"""
@@ -73,14 +72,22 @@ class EmailValidator:
             '10minutemail.com', 'tempmail.org', 'guerrillamail.com',
             'mailinator.com', 'temp-mail.org', '1secmail.com',
             'throwaway.email', 'maildrop.cc', 'yopmail.com',
-            'getnada.com', 'fakemail.net', 'spam4.me'
+            'getnada.com', 'fakemail.net', 'spam4.me',
+            'mohmal.com', 'emailondeck.com', '33mail.com',
+            'sharklasers.com', 'guerrillamail.info', 'guerrillamail.biz',
+            'guerrillamail.com', 'guerrillamail.de', 'guerrillamail.net',
+            'guerrillamail.org', 'guerrillamailblock.com', 'pokemail.net',
+            'spam.la', 'bccto.me', 'chacuo.net', 'devnullmail.com',
+            'dispostable.com', 'tempr.email', 'tempail.com'
         }
         
         # Emails baseados em função
         self.role_based_prefixes = {
             'admin', 'administrator', 'support', 'help', 'info',
             'contact', 'sales', 'marketing', 'noreply', 'no-reply',
-            'postmaster', 'webmaster', 'hostmaster', 'abuse'
+            'postmaster', 'webmaster', 'hostmaster', 'abuse',
+            'security', 'privacy', 'legal', 'billing', 'accounts',
+            'team', 'hello', 'mail', 'email', 'notifications'
         }
     
     def validate_email_format(self, email: str) -> Dict:
@@ -97,6 +104,13 @@ class EmailValidator:
             }
         
         local_part, domain = email.split('@')
+        
+        # Validações adicionais
+        if len(local_part) > 64 or len(domain) > 253:
+            return {
+                'is_valid_format': False,
+                'error': 'Email too long'
+            }
         
         return {
             'is_valid_format': True,
@@ -122,6 +136,10 @@ class EmailValidator:
                 'mx_count': len(mx_list)
             }
             
+        except dns.resolver.NXDOMAIN:
+            return {'has_mx': False, 'error': 'Domain not found'}
+        except dns.resolver.NoAnswer:
+            return {'has_mx': False, 'error': 'No MX records found'}
         except Exception as e:
             return {'has_mx': False, 'error': f'DNS error: {str(e)}'}
     
@@ -140,7 +158,9 @@ class EmailValidator:
         # Provedores gratuitos populares
         free_providers = {
             'gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com',
-            'aol.com', 'icloud.com', 'live.com', 'msn.com'
+            'aol.com', 'icloud.com', 'live.com', 'msn.com',
+            'ymail.com', 'mail.com', 'protonmail.com', 'tutanota.com',
+            'zoho.com', 'gmx.com', 'fastmail.com'
         }
         
         domain_info['is_free_provider'] = domain in free_providers
@@ -152,19 +172,25 @@ class EmailValidator:
         """Verifica se é um email baseado em função"""
         return local_part.lower() in self.role_based_prefixes
     
-    def check_deliverability(self, email: str, domain: str) -> Dict:
-        """Verifica se o email é entregável (simulado)"""
-        # Simulação baseada em padrões reais
+    def check_deliverability(self, email: str, domain: str, has_mx: bool) -> Dict:
+        """Verifica se o email é entregável"""
+        if not has_mx:
+            return {'is_deliverable': False, 'reason': 'No MX records'}
+        
         if domain in self.disposable_domains:
             return {'is_deliverable': False, 'reason': 'Disposable domain'}
         
         # Domínios populares têm alta deliverability
-        popular_domains = {'gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com'}
+        popular_domains = {
+            'gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com',
+            'aol.com', 'icloud.com', 'live.com', 'msn.com'
+        }
+        
         if domain in popular_domains:
             return {'is_deliverable': True, 'reason': 'Popular domain'}
         
-        # Outros domínios - simulação
-        return {'is_deliverable': random.choice([True, False]), 'reason': 'SMTP check'}
+        # Para outros domínios, assumir deliverability baseada em MX
+        return {'is_deliverable': True, 'reason': 'Has MX records'}
     
     def calculate_confidence_score(self, validation_result: Dict) -> float:
         """Calcula score de confiança da validação"""
@@ -208,6 +234,10 @@ class EmailValidator:
         if not validation_result.get('deliverability', {}).get('is_deliverable'):
             risk += 30
         
+        # Não tem MX records (+40 pontos de risco)
+        if not validation_result.get('domain', {}).get('has_mx'):
+            risk += 40
+        
         return min(risk, 100.0)
     
     def validate_email(self, email: str) -> EmailValidationResult:
@@ -239,7 +269,7 @@ class EmailValidator:
         mx_result = self.check_domain_mx(domain)
         
         # 4. Verificar entregabilidade
-        deliverability_result = self.check_deliverability(email, domain)
+        deliverability_result = self.check_deliverability(email, domain, mx_result.get('has_mx', False))
         
         # 5. Verificar se é baseado em função
         is_role_based = self.check_role_based(local_part)
@@ -274,22 +304,41 @@ class EmailValidator:
 def home():
     """Endpoint inicial"""
     return jsonify({
-        'message': 'Email Validation & Lead Enrichment API',
+        'message': 'Email Validation & Risk Assessment API',
         'version': '1.0.0',
-        'status': 'RUNNING',
+        'status': 'ONLINE',
         'timestamp': datetime.now().isoformat(),
+        'description': 'Professional email validation with unique A-D quality grading system',
+        'features': [
+            'Real-time email validation',
+            'A-D quality grading system',
+            'Confidence & Risk scoring',
+            'Disposable email detection',
+            'Role-based email identification',
+            'Bulk processing up to 100 emails',
+            'High-performance caching',
+            'Professional analytics'
+        ],
         'endpoints': {
             '/validate': 'Single email validation (cached)',
             '/validate-fresh': 'Single email validation (no cache)',
-            '/validate-bulk': 'Bulk email validation',
+            '/validate-bulk': 'Bulk email validation (up to 100)',
             '/clear-cache': 'Clear API cache',
-            '/cache-stats': 'Cache statistics',
             '/health': 'Health check'
         },
-        'cache_info': {
-            'cache_size': len(cache),
-            'cache_duration': CACHE_DURATION
-        }
+        'pricing': {
+            'free': '100 validations/month',
+            'starter': '$39/month - 5,000 validations',
+            'business': '$149/month - 25,000 validations',
+            'enterprise': '$499/month - 100,000 validations'
+        },
+        'differentiators': [
+            'Only API with A-D quality grades',
+            'Unique confidence scoring (0-100%)',
+            'Risk assessment system',
+            'Bulk statistics reporting',
+            'Fresh vs cached validation options'
+        ]
     })
 
 @app.route('/validate', methods=['POST'])
@@ -403,6 +452,12 @@ def validate_emails_bulk():
         valid_emails = sum(1 for r in results if r['is_valid'])
         deliverable_emails = sum(1 for r in results if r['is_deliverable'])
         disposable_emails = sum(1 for r in results if r['is_disposable'])
+        role_based_emails = sum(1 for r in results if r['is_role_based'])
+        
+        # Distribuição de grades
+        grade_distribution = {'A': 0, 'B': 0, 'C': 0, 'D': 0}
+        for r in results:
+            grade_distribution[r['quality_grade']] += 1
         
         return jsonify({
             'status': 'success',
@@ -412,10 +467,17 @@ def validate_emails_bulk():
                 'valid_emails': valid_emails,
                 'deliverable_emails': deliverable_emails,
                 'disposable_emails': disposable_emails,
+                'role_based_emails': role_based_emails,
                 'valid_percentage': round((valid_emails / total_emails * 100), 2) if total_emails > 0 else 0,
-                'deliverable_percentage': round((deliverable_emails / total_emails * 100), 2) if total_emails > 0 else 0
+                'deliverable_percentage': round((deliverable_emails / total_emails * 100), 2) if total_emails > 0 else 0,
+                'quality_distribution': grade_distribution
             },
-            'results': results
+            'results': results,
+            'recommendations': [
+                f"Remove {disposable_emails} disposable emails to improve deliverability",
+                f"Consider removing {role_based_emails} role-based emails for better engagement",
+                f"Focus on {grade_distribution['A']} Grade A emails for highest success rate"
+            ]
         })
         
     except Exception as e:
@@ -434,16 +496,6 @@ def clear_cache():
         'timestamp': datetime.now().isoformat()
     })
 
-@app.route('/cache-stats')
-def cache_stats():
-    """Estatísticas do cache"""
-    return jsonify({
-        'cache_size': len(cache),
-        'cache_keys': list(cache.keys())[:10],  # Primeiros 10
-        'cache_duration': CACHE_DURATION,
-        'timestamp': datetime.now().isoformat()
-    })
-
 @app.route('/health')
 def health_check():
     """Health check para monitoramento"""
@@ -451,7 +503,14 @@ def health_check():
         'status': 'healthy',
         'timestamp': datetime.now().isoformat(),
         'cache_size': len(cache),
-        'version': '1.0.0'
+        'version': '1.0.0',
+        'uptime': 'Running',
+        'python_version': '3.9+',
+        'dependencies': {
+            'flask': '2.3.3',
+            'requests': '2.31.0',
+            'dnspython': '2.4.2'
+        }
     })
 
 # Middleware para CORS
@@ -463,16 +522,11 @@ def after_request(response):
     return response
 
 if __name__ == '__main__':
-    print("🚀 Starting Email Validation API...")
-    print("📡 Server: http://localhost:5000")
-    print("📚 Endpoints:")
-    print("   - POST /validate (with cache)")
-    print("   - POST /validate-fresh (no cache)")
-    print("   - POST /validate-bulk")
-    print("   - POST /clear-cache")
-    print("   - GET /cache-stats")
-    print("   - GET /health")
-    print("⏹️  Stop: Ctrl+C")
-    print("="*50)
+    port = int(os.environ.get('PORT', 5000))
+    print("🚀 Email Validation API - Production Ready")
+    print(f"📡 Server starting on port {port}")
+    print("🎯 Endpoints: /validate, /validate-fresh, /validate-bulk")
+    print("📊 Features: A-D grades, confidence scores, risk analysis")
+    print("="*60)
     
-    app.run(debug=True, host='0.0.0.0', port=5001)
+    app.run(host='0.0.0.0', port=port, debug=False)
